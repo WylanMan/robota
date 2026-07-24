@@ -1,0 +1,1002 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>Agent Avatar</title>
+<style>
+  :root { --bg: #0e0e12; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; min-height: 100vh;
+    background: radial-gradient(1200px 800px at 50% 28%, #17171d, var(--bg));
+    display: flex; align-items: center; justify-content: center;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    color: #9a97a3;
+  }
+  .page { display: flex; flex-direction: column; align-items: center; gap: 18px; padding: 32px; }
+  /* circular crop, fully transparent -- drops into any UI */
+  .stage {
+    width: min(74vmin, 560px); aspect-ratio: 1;
+    border-radius: 50%; overflow: hidden; position: relative;
+    box-shadow: 0 0 0 1px rgba(255,255,255,.06), 0 30px 80px -20px rgba(0,0,0,.75);
+  }
+  .stage canvas { display: block; width: 100%; height: 100%; }
+  .caption { display: flex; gap: 9px; align-items: center; font-size: 13px; letter-spacing: .14em; text-transform: uppercase; }
+  .dot { width: 7px; height: 7px; border-radius: 50%; background: #58d68d; box-shadow: 0 0 9px #58d68d; animation: pulse 2.4s infinite; }
+  @keyframes pulse { 50% { opacity: .45; } }
+  .bar { display: flex; gap: 10px; align-items: center; }
+  button {
+    background: #1c1c23; color: #cfccd6; border: 1px solid rgba(255,255,255,.09);
+    padding: 9px 18px; border-radius: 999px; font: inherit; font-size: 12.5px;
+    cursor: pointer; transition: background .2s, border-color .2s;
+  }
+  button:hover { background: #26262f; border-color: rgba(255,255,255,.2); }
+  button:disabled { opacity: .4; cursor: default; }
+  #micBtn.live { background: #4a1f24; border-color: #a4454f; color: #ffb3ba; }
+  #micBtn.cont-active { background: #1f2b1f; border-color: #4a7d4a; color: #b3dfb3; }
+  input[type=text] {
+    background: #141419; color: #cfccd6; border: 1px solid rgba(255,255,255,.09);
+    padding: 9px 16px; border-radius: 999px; font: inherit; font-size: 12.5px;
+    width: min(46vw, 300px); outline: none;
+  }
+  input[type=text]:focus { border-color: rgba(255,255,255,.25); }
+  .convo {
+    min-height: 18px; max-width: min(72vmin, 560px); text-align: center;
+    font-size: 12.5px; color: #b9b6c2; line-height: 1.5;
+  }
+  .hint { font-size: 11px; color: #5b5966; }
+  .debug-panel {
+    position: fixed; top: 12px; right: 12px; z-index: 999;
+    background: rgba(0,0,0,.82); border: 1px solid rgba(255,255,255,.15);
+    border-radius: 10px; padding: 8px; display: flex; flex-direction: column; gap: 6px;
+  }
+  .debug-panel canvas { border-radius: 6px; display: block; }
+  .debug-info { font-size: 10px; color: #8f8; font-family: monospace; line-height: 1.4; }
+</style>
+<script type="importmap">{ "imports": { "three": "./vendor/three.module.js" } }</script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh@0.4.1633559619/face_mesh.js" crossorigin="anonymous"></script>
+<script>
+window.__headTracker = { x: 0, y: 0, tracking: false, faceFound: false, landmarks: null, faceSize: 0 };
+let __faceMesh = null, __camVideo = null;
+
+async function __startFaceMesh(videoEl) {
+  __camVideo = videoEl;
+  if (typeof FaceMesh === 'undefined') {
+    window.__headTracker._error = 'FaceMesh script not loaded';
+    throw new Error('FaceMesh script not loaded');
+  }
+  __faceMesh = new FaceMesh({
+    locateFile: (f) => `https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh@0.4.1633559619/${f}`
+  });
+  __faceMesh.setOptions({
+    maxNumFaces: 1,
+    refineLandmarks: false,
+    minDetectionConfidence: 0.7,
+    minTrackingConfidence: 0.7,
+  });
+  __faceMesh.onResults((results) => {
+    if (results.multiFaceLandmarks && results.multiFaceLandmarks.length > 0) {
+      const lm = results.multiFaceLandmarks[0];
+      const nose = lm[1];
+      window.__headTracker.x = (nose.x - 0.5) * 2;
+      window.__headTracker.y = (nose.y - 0.5) * 2;
+      // face size: distance between left temple (~234) and right temple (~454)
+      const l = lm[234], r = lm[454];
+      const dx = r.x - l.x, dy = r.y - l.y;
+      window.__headTracker.faceSize = Math.sqrt(dx * dx + dy * dy);
+      window.__headTracker.faceFound = true;
+      window.__headTracker.landmarks = lm;
+    } else {
+      window.__headTracker.faceFound = false;
+      window.__headTracker.landmarks = null;
+    }
+  });
+  await __faceMesh.initialize();
+  window.__headTracker._error = null;
+  window.__headTracker.tracking = true;
+  __processLoop();
+}
+
+async function __processLoop() {
+  if (!window.__headTracker.tracking) return;
+  if (__camVideo && __camVideo.readyState >= 2) {
+    await __faceMesh.send({ image: __camVideo });
+  }
+  requestAnimationFrame(__processLoop);
+}
+
+function __stopFaceMesh() {
+  window.__headTracker.tracking = false;
+  window.__headTracker.faceFound = false;
+  window.__headTracker.landmarks = null;
+  __faceMesh = null;
+}
+</script>
+</head>
+<body>
+<div class="page">
+  <div class="stage" id="stage"><canvas id="c"></canvas></div>
+  <div class="caption"><span class="dot"></span><span id="agentName">AI Agent</span></div>
+  <div class="convo" id="convo">click Continuous to chat hands-free &middot; Chinese or English</div>
+  <div class="bar">
+    <button id="micBtn">Continuous</button>
+    <input id="chatInput" type="text" placeholder="or type to her..." autocomplete="off"/>
+    <button id="sendBtn">&#8617;</button>
+    <button id="headTrackBtn" title="Track your head via webcam">&#9673; Head</button>
+  </div>
+  <video id="cam" autoplay playsinline muted style="display:none"></video>
+  <div id="debug" class="debug-panel" style="display:none">
+    <canvas id="debugCanvas" width="320" height="240"></canvas>
+    <div id="debugInfo" class="debug-info"></div>
+  </div>
+  <div class="hint">window.agentAvatar &middot; .setTalking(bool) &middot; .speak(text) &middot; .lookAt(x, y)</div>
+</div>
+
+<script type="module">
+import * as THREE from 'three';
+import { RoomEnvironment } from './vendor/RoomEnvironment.js';
+
+/* ================= config ================= */
+const CFG = {
+  name: 'AI Agent',
+  skin: 0xecb78f,
+  lip: 0xb25f58,
+  hair: 0x141317,
+  brow: 0x17110d,
+  knit: 0x9c5f66,      // soft rosewood knit top
+  knitDark: 0x855057,
+};
+document.getElementById('agentName').textContent = CFG.name;
+
+const clamp = (x, a, b) => Math.min(b, Math.max(a, x));
+const clamp01 = x => clamp(x, 0, 1);
+const sstep = (a, b, x) => { const t = clamp01((x - a) / (b - a)); return t * t * (3 - 2 * t); };
+const g2 = (dx, dy, s) => Math.exp(-(dx * dx + dy * dy) / (2 * s * s));
+
+/* ================= renderer / scene ================= */
+const stage = document.getElementById('stage');
+const canvas = document.getElementById('c');
+const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.setClearColor(0x000000, 0);
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.06;
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(27, 1, 0.1, 60);
+camera.position.set(0, -0.30, 7.3);
+camera.lookAt(0, -0.52, 0);
+
+const pmrem = new THREE.PMREMGenerator(renderer);
+scene.environment = pmrem.fromScene(new RoomEnvironment(), 0.04).texture;
+
+/* lights: warm key, cool fill, rim for hair separation */
+const key = new THREE.DirectionalLight(0xfff1e0, 2.0); key.position.set(2.5, 3, 4); scene.add(key);
+const fill = new THREE.DirectionalLight(0xdfe8ff, 0.55); fill.position.set(-3, 0.5, 3); scene.add(fill);
+const rim = new THREE.DirectionalLight(0xffffff, 0.8); rim.position.set(-1.5, 2.5, -3.5); scene.add(rim);
+scene.add(new THREE.HemisphereLight(0xfff6ee, 0x2a2028, 0.35));
+
+/* ================= procedural canvas textures ================= */
+function irisTexture() {
+  const c = document.createElement('canvas'); c.width = c.height = 256;
+  const x = c.getContext('2d');
+  let g = x.createRadialGradient(128, 128, 10, 128, 128, 128);
+  g.addColorStop(0, '#2a1608'); g.addColorStop(0.45, '#4a2c14');
+  g.addColorStop(0.8, '#5f3d1e'); g.addColorStop(0.95, '#24140a'); g.addColorStop(1, '#160c05');
+  x.fillStyle = g; x.beginPath(); x.arc(128, 128, 128, 0, 7); x.fill();
+  for (let i = 0; i < 150; i++) {
+    const a = Math.random() * Math.PI * 2, r0 = 34 + Math.random() * 18, r1 = 92 + Math.random() * 32;
+    x.strokeStyle = `rgba(${140 + Math.random() * 80 | 0},${88 + Math.random() * 40 | 0},${38 + Math.random() * 26 | 0},${0.22 + Math.random() * 0.3})`;
+    x.lineWidth = 1 + Math.random() * 1.7;
+    x.beginPath(); x.moveTo(128 + Math.cos(a) * r0, 128 + Math.sin(a) * r0);
+    x.lineTo(128 + Math.cos(a) * r1, 128 + Math.sin(a) * r1); x.stroke();
+  }
+  for (let i = 0; i < 70; i++) {
+    const a = Math.random() * Math.PI * 2, r0 = 36 + Math.random() * 20, r1 = 95 + Math.random() * 30;
+    x.strokeStyle = `rgba(28,14,6,${0.25 + Math.random() * 0.35})`;
+    x.lineWidth = 1 + Math.random() * 1.5;
+    x.beginPath(); x.moveTo(128 + Math.cos(a) * r0, 128 + Math.sin(a) * r0);
+    x.lineTo(128 + Math.cos(a) * r1, 128 + Math.sin(a) * r1); x.stroke();
+  }
+  x.strokeStyle = 'rgba(18,9,4,0.55)'; x.lineWidth = 4;
+  x.beginPath(); x.arc(128, 128, 54, 0, 7); x.stroke();
+  g = x.createRadialGradient(128, 128, 4, 128, 128, 48);
+  g.addColorStop(0, '#000'); g.addColorStop(0.85, '#050302'); g.addColorStop(1, 'rgba(5,3,2,0)');
+  x.fillStyle = g; x.beginPath(); x.arc(128, 128, 48, 0, 7); x.fill();
+  x.strokeStyle = 'rgba(8,4,2,0.85)'; x.lineWidth = 12;
+  x.beginPath(); x.arc(128, 128, 122, 0, 7); x.stroke();
+  const t = new THREE.CanvasTexture(c); t.colorSpace = THREE.SRGBColorSpace; return t;
+}
+function blushTexture() {
+  const c = document.createElement('canvas'); c.width = c.height = 128;
+  const x = c.getContext('2d');
+  const g = x.createRadialGradient(64, 64, 4, 64, 64, 62);
+  g.addColorStop(0, 'rgba(255,110,100,0.55)'); g.addColorStop(0.6, 'rgba(255,110,100,0.18)');
+  g.addColorStop(1, 'rgba(255,110,100,0)');
+  x.fillStyle = g; x.fillRect(0, 0, 128, 128);
+  const t = new THREE.CanvasTexture(c); t.colorSpace = THREE.SRGBColorSpace; return t;
+}
+function knitBump() {
+  const c = document.createElement('canvas'); c.width = c.height = 128;
+  const x = c.getContext('2d');
+  x.fillStyle = '#808080'; x.fillRect(0, 0, 128, 128);
+  for (let i = 0; i < 128; i += 5) {
+    x.strokeStyle = 'rgba(70,70,70,0.9)'; x.lineWidth = 2; x.beginPath();
+    for (let y = 0; y <= 128; y += 4) x.lineTo(i + Math.sin(y * 0.4 + i) * 1.1, y);
+    x.stroke();
+    x.strokeStyle = 'rgba(150,150,150,0.7)'; x.lineWidth = 1; x.beginPath();
+    for (let y = 0; y <= 128; y += 4) x.lineTo(i + 2 + Math.sin(y * 0.4 + i + 1) * 1.1, y);
+    x.stroke();
+  }
+  const t = new THREE.CanvasTexture(c);
+  t.wrapS = t.wrapT = THREE.RepeatWrapping; t.repeat.set(7, 4); return t;
+}
+const irisTex = irisTexture(), blushTex = blushTexture(), knitTex = knitBump();
+
+/* ================= materials ================= */
+const skinMat = new THREE.MeshPhysicalMaterial({
+  color: CFG.skin, roughness: 0.56, metalness: 0,
+  clearcoat: 0.12, clearcoatRoughness: 0.6,
+  sheen: 0.25, sheenColor: 0xffd9c0, envMapIntensity: 0.55,
+});
+const lidMat = skinMat.clone(); lidMat.side = THREE.DoubleSide; lidMat.roughness = 0.5;
+const lipMat = new THREE.MeshPhysicalMaterial({
+  color: CFG.lip, roughness: 0.36, clearcoat: 0.4, clearcoatRoughness: 0.35, envMapIntensity: 0.65,
+});
+const hairMat = new THREE.MeshStandardMaterial({
+  color: CFG.hair, roughness: 0.55, metalness: 0.0, envMapIntensity: 0.35, side: THREE.DoubleSide,
+});
+const browMat = new THREE.MeshStandardMaterial({ color: CFG.brow, roughness: 0.65 });
+const eyeWhiteMat = new THREE.MeshPhysicalMaterial({
+  color: 0xefe6da, roughness: 0.2, clearcoat: 0.7, clearcoatRoughness: 0.2, envMapIntensity: 1.0,
+});
+const irisMat = new THREE.MeshStandardMaterial({ map: irisTex, roughness: 0.25, envMapIntensity: 0.8 });
+const knitMat = new THREE.MeshStandardMaterial({
+  color: CFG.knit, roughness: 0.95, bumpMap: knitTex, bumpScale: 0.015, envMapIntensity: 0.2,
+});
+const knitDarkMat = new THREE.MeshStandardMaterial({
+  color: CFG.knitDark, roughness: 0.9, bumpMap: knitTex, bumpScale: 0.015, envMapIntensity: 0.4,
+});
+const darkMouthMat = new THREE.MeshBasicMaterial({ color: 0x3d1e22 });
+const teethMat = new THREE.MeshStandardMaterial({ color: 0xf7f1e6, roughness: 0.25 });
+const nostrilMat = new THREE.MeshStandardMaterial({ color: 0x4a2a22, roughness: 0.85 });
+
+/* ================= hierarchy ================= */
+const avatar = new THREE.Group(); scene.add(avatar);
+const bodyGroup = new THREE.Group(); avatar.add(bodyGroup);
+const headGroup = new THREE.Group(); avatar.add(headGroup);
+
+/* ================= head sculpt ================= */
+function buildHead() {
+  const geo = new THREE.SphereGeometry(1, 110, 110);
+  const p = geo.attributes.position;
+  const n = new THREE.Vector3();
+  for (let i = 0; i < p.count; i++) {
+    n.fromBufferAttribute(p, i).normalize();
+    let x = n.x * 0.92, y = n.y * 1.15, z = n.z * 0.98;
+    const front = sstep(0.05, 0.6, n.z);
+    const low = sstep(0.1, -0.7, n.y);          // 0 at brow, 1 at chin
+    const side = clamp01(Math.abs(n.x) / 0.75);
+
+    x *= 1 - 0.24 * low * (0.35 + 0.65 * front) * (0.25 + 0.75 * side); // jaw taper
+
+    const cb = g2(Math.abs(n.x) - 0.46, n.y + 0.02, 0.16) * front;      // cheekbones
+    z += 0.030 * cb; x += Math.sign(n.x) * 0.018 * cb;
+    z += 0.020 * g2(Math.abs(n.x) - 0.42, n.y + 0.28, 0.20) * front;    // cheek fullness
+
+    z -= 0.038 * g2(Math.abs(n.x) - 0.34, n.y - 0.14, 0.15) * front;    // eye sockets
+    z += 0.020 * g2(Math.abs(n.x) - 0.30, n.y - 0.33, 0.13) * front;    // brow ridge
+    z -= 0.020 * g2(n.x, n.y - 0.27, 0.09) * front;                     // nasion dip
+    z += 0.022 * g2(n.x, n.y + 0.40, 0.20) * front;                     // lip mound
+
+    const ch = g2(n.x, n.y + 0.86, 0.20) * front;                       // chin
+    z += 0.032 * ch; y += 0.012 * ch;
+
+    if (n.z < 0) z *= 1.03;                                             // fuller skull back
+    if (n.y < -0.72) {                                                  // blend into neck
+      const k = -0.72 - n.y;
+      y -= k * 0.55; x *= 1 - 0.25 * k; z *= 1 - 0.15 * k;
+    }
+    p.setXYZ(i, x, y, z);
+  }
+  geo.computeVertexNormals();
+  return new THREE.Mesh(geo, skinMat);
+}
+headGroup.add(buildHead());
+
+/* ================= eyes + eyelids ================= */
+const LID_OPEN = -0.24, LID_CLOSED = 0.45;
+const eyePivots = [], upperLids = [], lowerLids = [];
+
+function buildEye(sideSign) {
+  const socket = new THREE.Group();
+  socket.position.set(sideSign * 0.335, 0.14, 0.83);
+  socket.scale.set(1.02, 0.88, 1);
+  socket.rotation.y = sideSign * 0.06;
+  socket.rotation.z = sideSign * 0.06;      // almond tilt, outer corner up
+
+  const pivot = new THREE.Group();          // gaze rotation happens here
+  socket.add(pivot);
+
+  const ball = new THREE.Mesh(new THREE.SphereGeometry(0.135, 48, 32), eyeWhiteMat);
+  pivot.add(ball);
+
+  const iris = new THREE.Mesh(new THREE.CircleGeometry(0.073, 48), irisMat);
+  iris.position.z = 0.1335;
+  pivot.add(iris);
+
+  // upper lid shell + lash line
+  const lidUp = new THREE.Group();
+  const upShell = new THREE.Mesh(
+    new THREE.SphereGeometry(0.148, 48, 24, 0, Math.PI * 2, 0, 1.35), lidMat);
+  lidUp.add(upShell);
+  const lashPts = [];
+  for (let a = -0.95; a <= 0.95; a += 0.1) {
+    lashPts.push(new THREE.Vector3(Math.sin(a) * 0.147, Math.cos(1.35) * 0.148, Math.cos(a) * 0.147));
+  }
+  const lash = new THREE.Mesh(
+    new THREE.TubeGeometry(new THREE.CatmullRomCurve3(lashPts), 24, 0.0065, 6), browMat);
+  lidUp.add(lash);
+  lidUp.rotation.x = LID_OPEN;
+  socket.add(lidUp);
+
+  // lower lid shell
+  const lidLo = new THREE.Group();
+  lidLo.add(new THREE.Mesh(
+    new THREE.SphereGeometry(0.146, 48, 16, 0, Math.PI * 2, Math.PI - 0.6, 0.6), lidMat));
+  lidLo.rotation.x = 0.18;
+  socket.add(lidLo);
+
+  headGroup.add(socket);
+  eyePivots.push(pivot); upperLids.push(lidUp); lowerLids.push(lidLo);
+}
+buildEye(1); buildEye(-1);
+
+/* ================= brows ================= */
+function buildBrow(sideSign) {
+  const pts = [
+    new THREE.Vector3(sideSign * 0.16, 0.325, 0.90),
+    new THREE.Vector3(sideSign * 0.28, 0.365, 0.885),
+    new THREE.Vector3(sideSign * 0.40, 0.355, 0.845),
+    new THREE.Vector3(sideSign * 0.47, 0.310, 0.775),
+  ];
+  const mesh = new THREE.Mesh(
+    new THREE.TubeGeometry(new THREE.CatmullRomCurve3(pts), 24, 0.024, 8), browMat);
+  headGroup.add(mesh);
+}
+buildBrow(1); buildBrow(-1);
+
+/* ================= nose ================= */
+{
+  const nose = new THREE.Group();
+  const bridge = new THREE.Mesh(new THREE.CylinderGeometry(0.05, 0.075, 0.34, 24), skinMat);
+  bridge.position.set(0, 0.07, 0.955); bridge.rotation.x = -0.16;
+  const tip = new THREE.Mesh(new THREE.SphereGeometry(0.075, 24, 18), skinMat);
+  tip.position.set(0, -0.115, 1.0); tip.scale.set(1, 0.85, 0.9);
+  const wingL = new THREE.Mesh(new THREE.SphereGeometry(0.085, 20, 14), skinMat);
+  wingL.position.set(0.082, -0.17, 0.93); wingL.scale.set(0.62, 0.42, 0.5);
+  const wingR = wingL.clone(); wingR.position.x *= -1;
+  const septum = new THREE.Mesh(new THREE.SphereGeometry(0.03, 12, 10), skinMat);
+  septum.position.set(0, -0.185, 0.955); septum.scale.set(0.5, 0.6, 0.7);
+  const nosL = new THREE.Mesh(new THREE.SphereGeometry(0.016, 10, 8), nostrilMat);
+  nosL.position.set(0.042, -0.20, 0.945);
+  const nosR = nosL.clone(); nosR.position.x *= -1;
+  nose.add(bridge, tip, wingL, wingR, septum, nosL, nosR);
+  headGroup.add(nose);
+}
+
+/* ================= mouth ================= */
+const mouthUpper = new THREE.Group(), mouthLower = new THREE.Group();
+let mouthCavity, teeth;
+{
+  mouthUpper.position.set(0, -0.395, 0.925);
+  const mkHalf = (s) => {
+    const m = new THREE.Mesh(new THREE.SphereGeometry(0.115, 24, 18), lipMat);
+    m.scale.set(1, 0.45, 0.55);
+    m.position.x = s * 0.085;
+    m.position.y = 0.012;                     // lifted corners: soft smile
+    m.rotation.z = s * 0.20;                  // outer corners up = warm smile
+    m.rotation.y = s * 0.12;
+    return m;
+  };
+  const tubercle = new THREE.Mesh(new THREE.SphereGeometry(0.06, 16, 12), lipMat);
+  tubercle.scale.set(1, 0.5, 0.5); tubercle.position.set(0, 0.004, 0.012);
+  mouthUpper.add(mkHalf(1), mkHalf(-1), tubercle);
+
+  mouthLower.position.set(0, -0.498, 0.915);
+  const lo = new THREE.Mesh(new THREE.SphereGeometry(0.125, 24, 18), lipMat);
+  lo.scale.set(1.18, 0.5, 0.6);
+  mouthLower.add(lo);
+
+  mouthCavity = new THREE.Mesh(new THREE.CircleGeometry(0.5, 32), darkMouthMat);
+  mouthCavity.position.set(0, -0.44, 0.905);
+  mouthCavity.scale.set(0.36, 0.001, 1);
+
+  teeth = new THREE.Mesh(new THREE.SphereGeometry(0.09, 20, 14), teethMat);
+  teeth.scale.set(1.05, 0.32, 0.35);
+  teeth.position.set(0, -0.425, 0.9);
+  teeth.visible = false;
+
+  headGroup.add(mouthUpper, mouthLower, mouthCavity, teeth);
+}
+
+/* ================= blush ================= */
+for (const s of [1, -1]) {
+  const b = new THREE.Mesh(
+    new THREE.PlaneGeometry(0.3, 0.22),
+    new THREE.MeshBasicMaterial({ map: blushTex, transparent: true, opacity: 0.4, depthWrite: false }));
+  b.position.set(s * 0.42, -0.08, 0.82);
+  b.rotation.y = s * 0.5; b.rotation.x = -0.1;
+  headGroup.add(b);
+}
+
+/* ================= hair ================= */
+function paramGeometry(cols, rows, fn) {
+  const pos = [], idx = [];
+  for (let j = 0; j <= rows; j++) for (let i = 0; i <= cols; i++) {
+    const [x, y, z] = fn(i / cols, j / rows); pos.push(x, y, z);
+  }
+  for (let j = 0; j < rows; j++) for (let i = 0; i < cols; i++) {
+    const a = j * (cols + 1) + i, b = a + 1, c = a + cols + 1, d = c + 1;
+    idx.push(a, c, b, b, c, d);
+  }
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+  g.setIndex(idx); g.computeVertexNormals();
+  return g;
+}
+const cubic = (P, t) => {
+  const u = 1 - t;
+  return [
+    u*u*u*P[0][0] + 3*u*u*t*P[1][0] + 3*u*t*t*P[2][0] + t*t*t*P[3][0],
+    u*u*u*P[0][1] + 3*u*u*t*P[1][1] + 3*u*t*t*P[2][1] + t*t*t*P[3][1],
+    u*u*u*P[0][2] + 3*u*u*t*P[1][2] + 3*u*t*t*P[2][2] + t*t*t*P[3][2],
+  ];
+};
+
+// crown cap
+{
+  const crown = new THREE.Mesh(
+    new THREE.SphereGeometry(1.085, 64, 40, 0, Math.PI * 2, 0, 1.60), hairMat);
+  crown.position.set(0, 0.12, -0.09);
+  crown.scale.set(1.0, 1.06, 1.02);
+  crown.rotation.x = -0.45;  // tilts sphere pole back (hides pinch), lifts front rim into a hairline
+  crown.rotation.z = 0.02;   // subtle side part
+  headGroup.add(crown);
+}
+// back sheet: long straight fall
+{
+  const g = paramGeometry(48, 26, (u, v) => {
+    const a = (u - 0.5) * 2 * 1.32;
+    const y = 0.62 - 3.0 * Math.pow(v, 0.92);
+    let r = 1.02 + 0.22 * sstep(0, 0.3, v) - 0.06 * sstep(0.75, 1, v);
+    r *= 1 - 0.05 * Math.abs(a / 1.32);
+    const x = Math.sin(a) * r * 0.98;
+    const z = -Math.cos(a) * r - 0.06 - 0.15 * sstep(0.6, 1, v);
+    return [x, y, z];
+  });
+  headGroup.add(new THREE.Mesh(g, hairMat));
+}
+// front curtains framing the face
+function buildCurtain(s) {
+  const P = [
+    [s * 0.12, 1.02, 0.55],
+    [s * 0.48, 0.80, 0.70],
+    [s * 0.78, -0.10, 0.55],
+    [s * 0.60, -1.95, 0.25],
+  ];
+  const g = paramGeometry(10, 30, (u, v) => {
+    const bp = cubic(P, v);
+    const w = 0.55 * (1 - v * 0.30);
+    const off = (u - 0.35) * w;
+    const curl = sstep(0.7, 1, v) * 0.12;
+    return [bp[0] + s * 0.55 * off - s * curl * 0.5, bp[1], bp[2] - 0.84 * off + curl * 0.3];
+  });
+  headGroup.add(new THREE.Mesh(g, hairMat));
+}
+buildCurtain(1); buildCurtain(-1);
+// side hair masses filling the gap between curtains and back hair
+for (const s of [1, -1]) {
+  const pad = new THREE.Mesh(new THREE.SphereGeometry(1, 32, 24), hairMat);
+  pad.scale.set(0.34, 1.15, 0.58);
+  pad.position.set(s * 0.86, -0.35, -0.15);
+  headGroup.add(pad);
+}
+
+/* ================= body / knit top ================= */
+{
+  const neck = new THREE.Mesh(new THREE.CylinderGeometry(0.27, 0.31, 1.1, 32), skinMat);
+  neck.position.set(0, -1.42, -0.06);
+  bodyGroup.add(neck);
+
+  const trap = new THREE.Mesh(new THREE.SphereGeometry(1, 40, 24), knitMat);
+  trap.scale.set(1.2, 0.55, 0.65); trap.position.set(0, -2.0, -0.10);
+  const shoulders = new THREE.Mesh(new THREE.SphereGeometry(1, 48, 28), knitMat);
+  shoulders.scale.set(2.0, 0.78, 0.92); shoulders.position.set(0, -2.32, -0.14);
+  const chest = new THREE.Mesh(new THREE.SphereGeometry(1, 40, 24), knitMat);
+  chest.scale.set(1.35, 0.9, 0.75); chest.position.set(0, -2.55, 0.10);
+  const collar = new THREE.Mesh(new THREE.CylinderGeometry(0.335, 0.38, 0.42, 32, 1, true), knitDarkMat);
+  collar.position.set(0, -1.72, -0.02);
+  collar.material.side = THREE.DoubleSide;
+  bodyGroup.add(trap, shoulders, chest, collar);
+}
+
+/* ================= animation state ================= */
+const S = {
+  mouse: { x: 0, y: 0 }, lastMouse: -10, T: 0,
+  talking: false, open: 0, openTarget: 0, nextSyll: 0,
+  blinkStart: -1, nextBlink: 1.5,
+  eyeT: { x: 0, y: 0 }, eyeCur: { x: 0, y: 0 }, nextSacc: 2,
+  contMode: false,
+};
+/* ================= head tracking (MediaPipe Face Mesh via global) ================= */
+const headTrackBtn = document.getElementById('headTrackBtn');
+const cam = document.getElementById('cam');
+const debugPanel = document.getElementById('debug');
+const debugCanvas = document.getElementById('debugCanvas');
+const debugInfo = document.getElementById('debugInfo');
+const debugCtx = debugCanvas.getContext('2d');
+let headTracking = false, headPos = { x: 0, y: 0 };
+let headSmooth = { x: 0, y: 0 };
+let leanSmooth = 0;   // smoothed face size for lean detection
+
+function processHeadFrame() {
+  if (!headTracking) return;
+  requestAnimationFrame(processHeadFrame);
+  const T = window.__headTracker;
+
+  /* ---- debug draw ---- */
+  const DW = debugCanvas.width, DH = debugCanvas.height;
+  if (cam.readyState >= 2 && cam.videoWidth > 0) {
+    debugCtx.drawImage(cam, 0, 0, DW, DH);
+  }
+
+  if (!T.tracking || cam.readyState < 2) {
+    if (!T.tracking) debugInfo.innerHTML = T._error ? 'init error: ' + T._error : 'loading model...';
+    return;
+  }
+
+  if (T.faceFound) {
+    const rx = T.x, ry = T.y;
+    headSmooth.x += (rx - headSmooth.x) * 0.25;
+    headSmooth.y += (ry - headSmooth.y) * 0.25;
+    // higher sensitivity so small head movements produce visible avatar reaction
+    headPos.x = clamp(-headSmooth.x * 1.1, -0.60, 0.60);
+    headPos.y = clamp(headSmooth.y * 0.90, -0.45, 0.45);
+    // lean: track face width and normalise (typical at arm's length ~0.25)
+    const rawLean = T.faceSize || 0.25;
+    leanSmooth += (rawLean - leanSmooth) * 0.20;
+    S.lastMouse = S.T;
+  }
+
+  if (T.landmarks) {
+    debugCtx.fillStyle = 'rgba(0,255,100,0.7)';
+    for (const lm of T.landmarks) {
+      debugCtx.fillRect(lm.x * DW - 1, lm.y * DH - 1, 2, 2);
+    }
+    const nose = T.landmarks[1];
+    const fx = nose.x * DW, fy = nose.y * DH;
+    debugCtx.strokeStyle = '#ff4444'; debugCtx.lineWidth = 2;
+    debugCtx.beginPath(); debugCtx.moveTo(fx - 14, fy); debugCtx.lineTo(fx + 14, fy); debugCtx.stroke();
+    debugCtx.beginPath(); debugCtx.moveTo(fx, fy - 14); debugCtx.lineTo(fx, fy + 14); debugCtx.stroke();
+    debugCtx.beginPath(); debugCtx.arc(fx, fy, 18, 0, Math.PI * 2); debugCtx.stroke();
+  }
+  debugInfo.innerHTML =
+    `raw: (${T.x.toFixed(3)}, ${T.y.toFixed(3)})<br>` +
+    `smooth: (${headSmooth.x.toFixed(3)}, ${headSmooth.y.toFixed(3)})<br>` +
+    `pos: (${headPos.x.toFixed(3)}, ${headPos.y.toFixed(3)})<br>` +
+    `face: ${T.faceFound ? 'yes' : 'no'} &nbsp; lean: ${(T.faceSize||0).toFixed(3)}`;
+}
+
+function toggleHeadTrack() {
+  if (headTracking) {
+    headTracking = false;
+    headTrackBtn.classList.remove('headtrack-on');
+    headTrackBtn.textContent = '\u25ef Head';
+    debugPanel.style.display = 'none';
+    __stopFaceMesh();
+    if (cam.srcObject) { cam.srcObject.getTracks().forEach(t => t.stop()); cam.srcObject = null; }
+    return;
+  }
+  headTrackBtn.textContent = '\u25cc Head...';
+  debugPanel.style.display = 'flex';
+  debugInfo.innerHTML = 'requesting camera...';
+  navigator.mediaDevices.getUserMedia({ video: { width: 640, height: 480, facingMode: 'user' } })
+    .then(stream => {
+      cam.srcObject = stream;
+      debugInfo.innerHTML = 'loading face model...';
+      return __startFaceMesh(cam);
+    })
+    .then(() => {
+      headTracking = true;
+      headTrackBtn.classList.add('headtrack-on');
+      headTrackBtn.textContent = '\u25c9 Head';
+      requestAnimationFrame(processHeadFrame);
+    })
+    .catch(err => {
+      if (!cam.srcObject) {
+        headTrackBtn.textContent = '\u25ef Head (denied)';
+        debugInfo.innerHTML = 'camera denied';
+      } else {
+        headTrackBtn.textContent = '\u25ef Head (error)';
+        debugInfo.innerHTML = 'model error: ' + (err.message || err).slice(0, 40);
+      }
+    });
+}
+
+headTrackBtn.addEventListener('click', toggleHeadTrack);
+
+/* ---- headtrack button on-state ---- */
+const headStyle = document.createElement('style');
+headStyle.textContent = '#headTrackBtn.headtrack-on { background: #1f2b3a; border-color: #4a7d9f; color: #b3d4df; }';
+document.head.appendChild(headStyle);
+
+const reduced = matchMedia('(prefers-reduced-motion: reduce)').matches;
+const swayAmp = reduced ? 0.3 : 1;
+
+addEventListener('pointermove', e => {
+  S.mouse.x = (e.clientX / innerWidth) * 2 - 1;
+  S.mouse.y = (e.clientY / innerHeight) * 2 - 1;
+  S.lastMouse = S.T;
+});
+
+function setLids(b) {
+  for (const l of upperLids) l.rotation.x = LID_OPEN + (LID_CLOSED - LID_OPEN) * b;
+  for (const l of lowerLids) l.rotation.x = 0.18 - b * 0.18;
+}
+function applyMouth(open) {
+  mouthLower.position.y = -0.498 - open * 0.085;
+  mouthUpper.position.y = -0.395 + open * 0.012;
+  mouthCavity.scale.y = 0.001 + open * 0.26;
+  mouthCavity.position.y = -0.44 - open * 0.03;
+  teeth.visible = open > 0.05;
+  teeth.scale.y = 0.32 * (0.4 + open);
+}
+
+const clock = new THREE.Clock();
+function tick() {
+  requestAnimationFrame(tick);
+  const dt = Math.min(clock.getDelta(), 0.05);
+  const t = clock.elapsedTime; S.T = t;
+  const idle = t - S.lastMouse > 3.5;
+
+  // gaze: head-track > cursor > idle drift
+  let gazeX = 0, gazeY = 0, gy = 0, gx = 0;
+  if (headTracking) {
+    gazeX = -headSmooth.x;
+    gazeY = headSmooth.y;
+    // head: slow follow with dead zone (~5% of screen)
+    const hx = Math.abs(gazeX) > 0.05 ? (gazeX - Math.sign(gazeX) * 0.05) * 0.40 : 0;
+    const hy = Math.abs(gazeY) > 0.05 ? (gazeY - Math.sign(gazeY) * 0.05) * 0.28 : 0;
+    gy = hx; gx = hy;
+    // eyes: tiny nudge only — stare at user, not past them
+    S.eyeT.y = clamp(gazeX * 0.06, -0.05, 0.05);
+    S.eyeT.x = clamp(gazeY * 0.05, -0.04, 0.04);
+  } else if (!idle) {
+    gazeX = S.mouse.x; gazeY = S.mouse.y;
+    gy = gazeX * 0.36; gx = gazeY * 0.16;
+    S.eyeT.y = gazeX * 0.10; S.eyeT.x = gazeY * 0.06;
+  }
+  else {
+    gy = (Math.sin(t * 0.4) * 0.05 + Math.sin(t * 0.23) * 0.03) * swayAmp;
+    gx = Math.sin(t * 0.31) * 0.025 * swayAmp;
+  }
+  headGroup.rotation.y += (gy - headGroup.rotation.y) * Math.min(1, dt * 3);
+  headGroup.rotation.x += (gx + S.open * 0.028 - headGroup.rotation.x) * Math.min(1, dt * 3);
+  headGroup.rotation.z += ((headTracking ? gazeX : -gazeX) * 0.03 - headGroup.rotation.z) * Math.min(1, dt * 3);
+
+  // lean reaction
+  if (headTracking) {
+    const ln = clamp((leanSmooth - 0.24) * 3.5, -0.08, 0.25);
+    headGroup.position.z += (ln - headGroup.position.z) * Math.min(1, dt * 3);
+  }
+
+  // idle saccades (cursor mode only)
+  if (!headTracking && !idle) {
+    /* eye target already set */;
+  } else if (!headTracking && t > S.nextSacc) {
+    S.eyeT.y = (Math.random() * 2 - 1) * 0.10;
+    S.eyeT.x = (Math.random() * 2 - 1) * 0.06;
+    S.nextSacc = t + 1.2 + Math.random() * 2.6;
+  }
+  S.eyeCur.y += (S.eyeT.y - S.eyeCur.y) * Math.min(1, dt * 10);
+  S.eyeCur.x += (S.eyeT.x - S.eyeCur.x) * Math.min(1, dt * 10);
+  for (const p of eyePivots) {
+    p.rotation.x = clamp(S.eyeCur.x, -0.3, 0.3);
+    p.rotation.y = clamp(S.eyeCur.y, -0.4, 0.4);
+  }
+
+  // breathing
+  const br = Math.sin(t * 1.5) * swayAmp;
+  bodyGroup.scale.set(1 + 0.006 * br, 1 + 0.012 * br, 1 + 0.008 * br);
+  headGroup.position.y = 0.012 * Math.sin(t * 1.5 + 0.6) * swayAmp;
+
+  // blinking (occasional double-blink)
+  if (S.holdBlink) { /* pinned by _setBlink */ }
+  else if (S.blinkStart < 0 && t > S.nextBlink) S.blinkStart = t;
+  if (S.holdBlink) { /* skip */ }
+  else if (S.blinkStart >= 0) {
+    const p = (t - S.blinkStart) / 0.26;
+    if (p >= 1) {
+      S.blinkStart = -1;
+      S.nextBlink = t + (Math.random() < 0.22 ? 0.35 : 2.2 + Math.random() * 3.5);
+      setLids(0);
+    } else setLids(Math.sin(Math.min(p, 1) * Math.PI));
+  }
+
+  // talking: random syllable envelope
+  if (S.talking) {
+    if (t > S.nextSyll) {
+      S.openTarget = 0.08 + Math.pow(Math.random(), 1.6) * 0.9;
+      if (Math.random() < 0.18) S.openTarget = 0.02;
+      S.nextSyll = t + 0.07 + Math.random() * 0.11;
+    }
+    S.open += (S.openTarget - S.open) * Math.min(1, dt * 18);
+  } else if (!S.holdOpen) {
+    S.open += (0 - S.open) * Math.min(1, dt * 8);
+  }
+  applyMouth(S.open);
+
+  renderer.render(scene, camera);
+}
+
+/* ================= API ================= */
+function setTalking(v) { S.talking = !!v; }
+window.agentAvatar = {
+  setTalking,
+  speak(text) { say(text || "Hi, I'm your AI agent. How can I help you today?"); },
+  lookAt(x, y) {
+    S.mouse.x = clamp(x, -1, 1); S.mouse.y = clamp(y, -1, 1); S.lastMouse = S.T;
+  },
+  _setOpen(v) {  // debug/testing: pin mouth openness, pass null to release
+    S.talking = false;
+    S.holdOpen = v != null;
+    if (v != null) { S.open = clamp(v, 0, 1); applyMouth(S.open); }
+  },
+  _setBlink(b) {  // debug/testing: pin lids, pass null to release
+    S.holdBlink = b != null;
+    if (b != null) { S.nextBlink = Infinity; setLids(clamp(b, 0, 1)); }
+    else S.nextBlink = S.T + 1;
+  },
+};
+
+/* ================= voice + chat ================= */
+const convo = document.getElementById('convo');
+const micBtn = document.getElementById('micBtn');
+const chatInput = document.getElementById('chatInput');
+const sendBtn = document.getElementById('sendBtn');
+const chatHistory = [];
+
+speechSynthesis.onvoiceschanged = () => speechSynthesis.getVoices();
+
+/* ---- Safari speech unlock ---- */
+let speechPrimed = false;
+function unlockSpeech() {
+  if (speechPrimed) return;
+  speechPrimed = true;
+  const u = new SpeechSynthesisUtterance(' ');
+  u.volume = 0;
+  speechSynthesis.speak(u);
+}
+
+/* ---- TTS: returns a promise so the conversation loop can wait ---- */
+function pickVoice(prefix) {
+  return speechSynthesis.getVoices().find(v => v.lang && v.lang.startsWith(prefix)) || null;
+}
+function say(text) {
+  return new Promise(resolve => {
+    const zh = /[\u4e00-\u9fff]/.test(text);
+    const u = new SpeechSynthesisUtterance(text);
+    u.lang = zh ? 'zh-CN' : 'en-US';
+    const v = pickVoice(zh ? 'zh' : 'en');
+    if (v) u.voice = v;
+    u.rate = 1.02;
+    let done = false;
+    const settle = () => { if (!done) { done = true; setTalking(false); resolve(); } };
+    u.onstart = () => setTalking(true);
+    u.onend = settle;
+    u.onerror = settle;
+    speechSynthesis.cancel();
+    speechSynthesis.speak(u);
+    setTimeout(() => {           // Safari may block TTS outside gestures — still animate
+      if (!done) {
+        setTalking(true);
+        setTimeout(settle, Math.min(8000, 600 + text.length * 90));
+      }
+    }, 900);
+  });
+}
+
+/* ---- chat round-trip (returns after TTS finishes) ---- */
+async function ask(text) {
+  text = text.trim();
+  if (!text) return;
+  convo.textContent = 'You: ' + text;
+  window.agentAvatar.lookAt(0.25, -0.35);
+  try {
+    const r = await fetch('/chat', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ message: text, history: chatHistory }),
+    });
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error || r.statusText);
+    chatHistory.push({ role: 'user', content: text }, { role: 'assistant', content: d.reply });
+    convo.textContent = 'Her: ' + d.reply;
+    await say(d.reply);
+  } catch (e) {
+    convo.textContent = '(connection error: ' + e.message + ')';
+    await say('Sorry, I lost my connection for a moment.');
+  }
+}
+
+/* ---- AudioContext VAD: detects silence to auto-stop recording ---- */
+let audioCtx = null, analyser = null, vadTimer = null;
+let silentFrames = 0, totalFrames = 0;
+const VAD_THRESHOLD = 0.015;
+const SILENCE_TICKS = 16;       // ~2.4 s of silence triggers auto-stop
+const VAD_INTERVAL = 150;
+const WARMUP_TICKS = 6;        // ignore first ~0.9 s
+
+function getRMS() {
+  const buf = new Uint8Array(analyser.fftSize);
+  analyser.getByteTimeDomainData(buf);
+  let s = 0;
+  for (let i = 0; i < buf.length; i++) { const v = (buf[i] - 128) / 128; s += v * v; }
+  return Math.sqrt(s / buf.length);
+}
+function startVAD() {
+  silentFrames = 0; totalFrames = 0;
+  vadTimer = setInterval(() => {
+    totalFrames++;
+    if (totalFrames <= WARMUP_TICKS) return;
+    if (getRMS() < VAD_THRESHOLD) {
+      silentFrames++;
+      if (silentFrames >= SILENCE_TICKS && recorder && recorder.state === 'recording') {
+        stopVAD();
+        recorder.stop();   // triggers onstop -> resolve startRecording()
+        convo.textContent = '(auto-stop)';
+      }
+    } else { silentFrames = 0; }
+  }, VAD_INTERVAL);
+}
+function stopVAD() { if (vadTimer) { clearInterval(vadTimer); vadTimer = null; } }
+
+/* ---- continuous conversation loop ---- */
+let mediaStream = null, recorder = null, chunks = [];
+
+function ensureMic() {
+  if (S.contMode) setContState('recording'); else micBtn.textContent = 'Continuous';
+  return mediaStream
+    ? Promise.resolve()
+    : navigator.mediaDevices.getUserMedia({ audio: true }).then(s => { mediaStream = s; });
+}
+function ensureAudioCtx() {
+  if (!audioCtx) {
+    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    const src = audioCtx.createMediaStreamSource(mediaStream);
+    analyser = audioCtx.createAnalyser();
+    analyser.fftSize = 256;
+    src.connect(analyser);
+  }
+  return audioCtx.state === 'suspended' ? audioCtx.resume() : Promise.resolve();
+}
+
+function startRecording() {
+  return new Promise(async (resolve, reject) => {
+    try {
+      if (!S.contMode) { resolve(); return; }
+      await ensureMic();
+      await ensureAudioCtx();
+      const mime = ['audio/mp4', 'audio/webm', ''].find(m => m === '' || MediaRecorder.isTypeSupported(m));
+      recorder = new MediaRecorder(mediaStream, mime ? { mimeType: mime } : undefined);
+      chunks = [];
+      recorder.ondataavailable = e => { if (e.data.size) chunks.push(e.data); };
+      recorder.onstop = () => resolve();
+      recorder.start();
+      startVAD();
+      convo.textContent = 'Listening... speak freely';
+    } catch (e) { reject(e); }
+  });
+}
+
+async function transcribeRecording() {
+  const blob = new Blob(chunks, { type: recorder.mimeType || 'audio/mp4' });
+  if (blob.size < 1000) { convo.textContent = '(too short)'; return ''; }
+  convo.textContent = 'Transcribing...';
+  try {
+    const r = await fetch('/transcribe', { method: 'POST',
+      headers: { 'Content-Type': blob.type }, body: blob });
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error || r.statusText);
+    return d.text || '';
+  } catch (e) { convo.textContent = '(transcribe error: ' + e.message + ')'; return ''; }
+}
+
+async function conversationStep() {
+  if (!S.contMode) return;
+  await startRecording();
+  if (!S.contMode) return;
+  const text = await transcribeRecording();
+  if (!S.contMode) return;
+  if (text) {
+    convo.textContent = 'You: ' + text;
+    await ask(text);
+  }
+  if (!S.contMode) return;
+  setContState('cont-active');
+  convo.textContent = '(listening for next turn...)';
+  await new Promise(r => setTimeout(r, 900));
+  conversationStep();
+}
+
+function setContState(st) {
+  micBtn.classList.remove('live', 'cont-active');
+  if (st === 'recording') { micBtn.classList.add('live'); micBtn.textContent = 'Stop'; }
+  else { micBtn.classList.add('cont-active'); micBtn.textContent = 'Continuous \u00b7 on'; }
+}
+
+async function enterContinuous() {
+  unlockSpeech();
+  S.contMode = true;
+  speechSynthesis.cancel();
+  setTalking(false);
+  conversationStep();
+}
+function exitContinuous() {
+  S.contMode = false;
+  stopVAD();
+  if (recorder && recorder.state === 'recording') recorder.stop();
+  speechSynthesis.cancel();
+  setTalking(false);
+  micBtn.classList.remove('live', 'cont-active');
+  micBtn.textContent = 'Continuous';
+  convo.textContent = 'continuous mode off';
+}
+
+/* ---- UI events: button, text input ---- */
+sendBtn.addEventListener('click', () => {
+  unlockSpeech();
+  const t = chatInput.value;
+  if (!t.trim()) return;
+  chatInput.value = '';
+  if (S.contMode) exitContinuous();
+  ask(t);
+});
+chatInput.addEventListener('keydown', e => {
+  if (e.key === 'Enter') { sendBtn.click(); }
+});
+
+if (!navigator.mediaDevices || !window.MediaRecorder) {
+  micBtn.disabled = true;
+  micBtn.title = 'Audio recording not supported in this browser';
+} else {
+  micBtn.addEventListener('click', () => {
+    if (S.contMode) {
+      if (recorder && recorder.state === 'recording') {
+        // submit current utterance early, stay in continuous mode
+        stopVAD(); recorder.stop();
+        micBtn.textContent = 'Stop';
+        return;
+      }
+      exitContinuous();      // click during transcribing / speaking / pause = exit
+      return;
+    }
+    enterContinuous();
+  });
+}
+
+/* ================= resize / go ================= */
+function resize() {
+  const s = stage.clientWidth;
+  renderer.setSize(s, stage.clientHeight, false);
+  camera.aspect = s / stage.clientHeight;
+  camera.updateProjectionMatrix();
+}
+addEventListener('resize', resize);
+resize();
+tick();
+</script>
+</body>
+</html>
